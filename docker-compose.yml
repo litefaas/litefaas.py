@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  nats:
+    build:
+      context: ./nats
+      dockerfile: Dockerfile
+    ports:
+      - "4222:4222"  # 클라이언트 연결
+      - "8222:8222"  # HTTP 모니터링
+      - "6222:6222"  # 클러스터링
+    volumes:
+      - ./nats/data:/data
+      - ./nats/config:/etc/nats
+    environment:
+      - NATS_SERVER_NAME=nats-server-1
+    restart: unless-stopped
+    networks:
+      - nats-network
+
+networks:
+  nats-network:
+    driver: bridge
