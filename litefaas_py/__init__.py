@@ -1,3 +1,3 @@
-from .core import LitefaasServer, LitefaasClient, run_server
+from .core import LitefaasWorker, LitefaasCaller, run_worker
 
-__all__ = ["LitefaasServer", "LitefaasClient", "run_server"]
+__all__ = ["LitefaasWorker ", "LitefaasCaller", "run_worker"]

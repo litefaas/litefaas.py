@@ -18,5 +18,5 @@ nkeys = ["nkeys"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.12"
-content-hash = "c18e98015616c156e013d6b92f00c093f2beacf8037659aa83e45a01a4766013"
+python-versions = ">=3.9"
+content-hash = "c097c53dcb7b0b2bc62a1dcbfc1dfa4ff685bfbaa49c7d3a3dfc851a2250e8be"

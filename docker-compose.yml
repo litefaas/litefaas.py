@@ -12,6 +12,7 @@ services:
     volumes:
       - ./nats/data:/data
       - ./nats/config:/etc/nats
+    command: ["-c", "/etc/nats/nats-server.conf"]
     environment:
       - NATS_SERVER_NAME=nats-server-1
     restart: unless-stopped
