@@ -1,7 +1,14 @@
 from edalite.core import EdaliteWorker
 import random
 
-worker = EdaliteWorker(debug=False)
+
+worker = EdaliteWorker(
+    nats_url="nats://localhost:4222",
+    redis_url="redis://localhost:6379/0",
+    debug=True,
+    max_process=2,
+    max_thread=1,
+)
 
 
 @worker.task("example.immediate", queue_group="immediate_workers")
@@ -18,4 +25,9 @@ def deferred_echo(data):
     return f"Deferred Echo: {data}"
 
 
-worker.start()
+if __name__ == "__main__":
+    from multiprocessing import freeze_support
+
+    freeze_support()
+
+    worker.start()

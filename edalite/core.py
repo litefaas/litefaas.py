@@ -1,90 +1,34 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Edalite Worker and Caller Implementation using NATS and JetStream KV Store
-==========================================================================
+Edalite Worker and Caller Implementation using NATS and Redis KV Store
+======================================================================
 
-This module provides a worker (server) and client (caller) implementation to
-handle immediate and deferred function execution via a NATS messaging system.
+이 모듈은 NATS 메시징 시스템과 Redis KV 스토어를 이용하여,
+즉시 실행과 지연(백그라운드) 실행을 하나의 작업 등록 방식으로 지원합니다.
+클라이언트는 요청 시 JSON 페이로드에 "mode" 필드로 요청 종류를 명시합니다.
+예를 들어, "immediate" 모드로 호출하면 작업이 완료된 후 결과를 응답하고,
+"deferred" 모드로 호출하면 caller 쪽에서 생성한 task_id를 응답한 후 작업 결과는 Redis에 저장됩니다.
+저장되는 작업 상태는 다음과 같이 진행됩니다:
+    - 초기 (caller 쪽에서 저장): QUEUED
+    - 작업 시작 시 (worker에서 업데이트): PROCESSING
+    - 작업 성공 시 (worker에서 업데이트): COMPLETED
+    - 작업 실패 시 (worker에서 업데이트): FAILURE
+
+클라이언트와 워커는 각각 동기/비동기 방식으로 사용할 수 있으며, Redis 및 NATS 연결은
+각각의 방식에 맞게 초기화됩니다.
 
 Classes
 -------
 EdaliteWorker
-    A synchronous worker that registers functions to be executed immediately
-    or in a deferred (background) manner upon receiving messages.
+    단일 데코레이터(@task)로 즉시/지연 작업을 등록하며, 클라이언트의 요청 페이로드("mode")
+    에 따라 조건문으로 즉시 실행 또는 백그라운드 실행(지연)을 수행합니다.
 EdaliteCaller
-    A synchronous client to call immediate or deferred functions on the worker.
+    동기 클라이언트로, request()와 delay() 호출 시 각각 "immediate"와 "deferred" 모드의
+    페이로드를 보내어 작업을 요청하며, Redis를 통해 작업 상태를 확인합니다.
 AsyncEdaliteCaller
-    An asynchronous client to call immediate or deferred functions on the worker.
-
-Usage Examples
---------------
-Example using EdaliteWorker and EdaliteCaller (synchronous):
-
-    from datetime import timedelta
-    import time
-    from edalite_module import EdaliteWorker, EdaliteCaller
-
-    # Create and register worker functions
-    worker = EdaliteWorker(nats_url="nats://localhost:4222", debug=True)
-
-    @worker.task("service.immediate", queue_group="group1")
-    def immediate_task(data):
-        print(f"Immediate task received: {data}")
-        return f"Processed immediate data: {data}"
-
-    @worker.delayed_task("service.deferred", queue_group="group2", ttl=timedelta(seconds=60))
-    def deferred_task(data):
-        print(f"Deferred task processing: {data}")
-        # Simulate processing delay
-        import time
-        time.sleep(2)
-        return f"Processed deferred data: {data}"
-
-    # Start the worker in a separate thread (blocks the main thread)
-    # In production, you might run the worker as a separate service.
-    threading.Thread(target=worker.start, daemon=True).start()
-
-    # Allow some time for the worker to start and subscribe to subjects.
-    time.sleep(1)
-
-    # Create a synchronous client (caller)
-    caller = EdaliteCaller(nats_url="nats://localhost:4222", debug=True).connect()
-
-    # Call immediate function
-    result_immediate = caller.request("service.immediate", "Hello Immediate!")
-    print(f"Immediate response: {result_immediate}")
-
-    # Call deferred function; this returns a task_id immediately.
-    task_id = caller.delay("service.deferred", "Hello Deferred!")
-    print(f"Deferred task_id: {task_id}")
-
-    # Wait for the deferred task to complete and then fetch its result.
-    time.sleep(3)
-    deferred_result = caller.get_deferred_result("service.deferred", task_id)
-    print(f"Deferred task result: {deferred_result}")
-
-    # Clean up
-    caller.close()
-
-
-Example using AsyncEdaliteCaller (asynchronous):
-
-    import asyncio
-    from edalite_module import AsyncEdaliteCaller
-
-    async def async_main():
-        caller = await AsyncEdaliteCaller.connect(nats_url="nats://localhost:4222", debug=True)
-        result = await caller.request("service.immediate", "Async Hello Immediate!")
-        print(f"Async Immediate response: {result}")
-        task_id = await caller.delay("service.deferred", "Async Hello Deferred!")
-        print(f"Async Deferred task_id: {task_id}")
-        await asyncio.sleep(3)
-        deferred_result = await caller.get_deferred_result("service.deferred", task_id)
-        print(f"Async Deferred task result: {deferred_result}")
-        await caller.close()
-
-    asyncio.run(async_main())
+    비동기 클라이언트로, request()와 delay() 호출 시 각각 "immediate"와 "deferred" 모드의
+    페이로드를 보내어 작업을 요청합니다.
 """
 
 import asyncio
@@ -92,147 +36,100 @@ import uuid
 import json
 import threading
 import time
-from datetime import timedelta
+from typing import Callable, Any, Union, List
+import os
+
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg as NATSMessage
-from nats.js.api import KeyValueConfig
-from typing import Callable, Any
-from nats.js.kv import KeyValue
+
+from redis import Redis
+from redis.asyncio import Redis as RedisAsync
+
+import concurrent.futures
+import multiprocessing
 
 
 ##############################################################################
-# Synchronous Worker (Server) Implementation
+# Synchronous Worker (Server) Implementation using Redis for KV Storage
 ##############################################################################
 class EdaliteWorker:
     """
-    A synchronous worker that registers functions for immediate and deferred
-    execution based on messages received via NATS.
+    Synchronous worker that registers functions for immediate and deferred execution
+    via NATS messaging. Depending on the client request payload ("mode"), the registered
+    task is executed immediately (responding with the result) or deferred (the worker
+    updates task state in Redis from PROCESSING to COMPLETED/FAILURE).
 
-    Immediate functions are executed upon message receipt, while deferred
-    functions are stored in a JetStream Key-Value store and processed in the
-    background.
-
-    Parameters
-    ----------
-    nats_url : str, optional
-        The URL of the NATS server (default is "nats://localhost:4222").
-    debug : bool, optional
-        If True, prints debug information (default is False).
-
-    Attributes
-    ----------
-    functions : dict
-        A mapping of subjects to a list of tuples (function, queue_group) for
-        immediate execution.
-    deferred_functions : dict
-        A mapping of subjects to a list of tuples (function, queue_group, ttl)
-        for deferred execution.
-    _nc : NATS or None
-        The asynchronous NATS client instance.
-    _js : JetStream or None
-        The JetStream context from the NATS client.
-    _kv_stores : dict
-        A mapping of subjects to their respective Key-Value store instances.
-    loop : asyncio.AbstractEventLoop or None
-        The asyncio event loop running in a separate thread.
+    Deferred tasks update their state in Redis:
+        - When processing starts: PROCESSING
+        - On success: COMPLETED
+        - On failure: FAILURE
+    (Caller already stores the initial QUEUED state.)
     """
 
-    def __init__(self, nats_url: str = "nats://localhost:4222", debug: bool = False):
+    def __init__(
+        self,
+        nats_url: Union[str, List[str]] = "nats://localhost:4222",
+        redis_url: str = "redis://localhost:6379/0",
+        debug: bool = False,
+        max_thread: int = 1,
+        max_process: int = 1,
+    ):
         self.nats_url = nats_url
-        self.functions = (
-            {}
-        )  # {subject: [(func, queue_group), ...]} for immediate execution
-        self.deferred_functions = (
-            {}
-        )  # {subject: [(func, queue_group, ttl), ...]} for deferred execution
-        self._nc = None  # NATS client (asynchronous)
-        self._js = None  # JetStream context
-        self._kv_stores = {}  # {subject: KeyValue} per subject for deferred tasks
+        self.redis_url = redis_url
         self.debug = debug
-        self.loop = None  # asyncio event loop running in background
 
-    def task(self, subject: str, queue_group: str = None) -> Callable:
-        """
-        Decorator to register an immediate execution task.
+        self.max_thread = max_thread
+        self.max_process = max_process
 
-        The decorated task will be executed synchronously (in a separate
-        thread) upon receiving a message on the specified subject.
+        # Register tasks with a single decorator (TTL 관련 코드는 사용하지 않음)
+        self.tasks = {}
 
-        Parameters
-        ----------
-        subject : str
-            The subject (channel) on which the message will be received.
-        queue_group : str, optional
-            The queue group name for load balancing (default is None).
+        self._nc = None
+        self._redis = None
+        self.loop = None
+        self.task_executor = None  # Determined at runtime
 
-        Returns
-        -------
-        Callable
-            The decorator task.
+        # Multiprocessing context for spawning processes
+        self._mp_context = multiprocessing.get_context("spawn")
 
-        Raises
-        ------
-        ValueError
-            If the same queue_group is already registered for the subject.
-        """
-
-        def decorator(task: Callable):
-            if subject not in self.functions:
-                self.functions[subject] = []
-            # Prevent duplicate registration for the same subject and queue group
-            for existing_task, existing_queue in self.functions[subject]:
-                if existing_queue == queue_group:
-                    raise ValueError(
-                        f"Queue group '{queue_group}' is already registered for subject '{subject}'"
-                    )
-            self.functions[subject].append((task, queue_group))
-            return task
-
-        return decorator
-
-    def delayed_task(
-        self, subject: str, queue_group: str = None, ttl: timedelta = timedelta(days=1)
+    def task(
+        self,
+        subject: str,
+        queue_group: str = None,
     ) -> Callable:
         """
-        Decorator to register a delayed execution task.
+        Decorator to register a task function for a given subject.
 
-        The message is acknowledged immediately with a generated task_id,
-        while the actual processing is done in the background. The result
-        is stored in a JetStream Key-Value (KV) store with the given TTL.
+        The client sends a JSON payload with "mode" set to "immediate" or "deferred".
+        For deferred mode, the caller already stores the initial state (QUEUED) in Redis.
+        The worker then updates the state:
+            - PROCESSING: when starting execution
+            - COMPLETED: on success
+            - FAILURE: on error
 
         Parameters
         ----------
         subject : str
-            The subject (channel) on which the message will be received.
+            Subject to listen on.
         queue_group : str, optional
-            The queue group name for load balancing (default is None).
-        ttl : timedelta, optional
-            The time-to-live for the KV store entry (default is 1 day).
+            Queue group for load balancing.
 
         Returns
         -------
         Callable
-            The decorator task.
-
-        Raises
-        ------
-        ValueError
-            If the same queue_group is already registered for the subject.
+            The decorator function.
         """
 
-        def decorator(task: Callable):
-            if subject not in self.deferred_functions:
-                self.deferred_functions[subject] = []
-            # Prevent duplicate registration for the same subject and queue group
-            for existing_task, existing_queue, _ in self.deferred_functions.get(
-                subject, []
-            ):
+        def decorator(func: Callable):
+            if subject not in self.tasks:
+                self.tasks[subject] = []
+            for existing_func, existing_queue in self.tasks[subject]:
                 if existing_queue == queue_group:
                     raise ValueError(
                         f"Queue group '{queue_group}' is already registered for subject '{subject}'"
                     )
-            self.deferred_functions[subject].append((task, queue_group, ttl))
-            return task
+            self.tasks[subject].append((func, queue_group))
+            return func
 
         return decorator
 
@@ -240,304 +137,275 @@ class EdaliteWorker:
         """
         Start the worker to listen for messages on registered subjects.
 
-        This method performs the following steps:
-            1. Starts a background asyncio event loop in a separate thread.
-            2. Initializes the NATS connection, JetStream context, and sets up subscriptions.
-            3. Blocks the main thread indefinitely until a KeyboardInterrupt occurs.
-
-        Examples
-        --------
-        >>> worker = EdaliteWorker(nats_url="nats://localhost:4222", debug=True)
-        >>> @worker.task("my.subject")
-        ... def my_immediate(data):
-        ...     return f"Processed {data}"
-        >>> worker.start()
+        If max_process > 1, multiple processes are spawned; each creates its own
+        asyncio event loop, NATS, and Redis connections.
         """
-        # 1. Start a background asyncio event loop
+        if self.max_process > 1:
+            print("---------------------------------------")
+            print(f"Starting {self.max_process} processes... (PID: {os.getpid()})")
+            print("---------------------------------------")
+
+            processes = []
+            for _ in range(self.max_process):
+                p = self._mp_context.Process(target=self._run_in_new_process)
+                p.start()
+                processes.append(p)
+
+            # 단순히 모든 프로세스를 대기 (join)시켜 종료되지 않도록 함
+            for p in processes:
+                p.join()
+        else:
+            self._start_single()
+
+    def _run_in_new_process(self):
+        """Logic executed in a new process for multiprocessing."""
+        self._start_single()
+
+    def _start_single(self):
+        """Actual worker logic for a single process."""
         self.loop = asyncio.new_event_loop()
         loop_thread = threading.Thread(target=self._run_loop, daemon=True)
         loop_thread.start()
 
-        # 2. Initialize NATS, JetStream, and subscriptions in the event loop
+        if self.max_thread > 1:
+            self.task_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_thread
+            )
+        else:
+            self.task_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
         future = asyncio.run_coroutine_threadsafe(self._init_nats(), self.loop)
         try:
-            future.result()  # Wait until initialization completes
+            future.result()  # Wait until NATS and Redis are initialized
         except Exception as e:
             if self.debug:
                 print(f"Error during NATS initialization: {e}")
             return
 
         if self.debug:
-            print("EdaliteWorker is running.")
-
-        # 3. Keep the main thread alive until interrupted
+            if self.max_process > 1:
+                print(
+                    f"EdaliteWorker is now running (multi process). (PID: {os.getpid()})"
+                )
+            else:
+                print(
+                    f"EdaliteWorker is now running (single process). (PID: {os.getpid()})"
+                )
+        print("================================================")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             if self.debug:
-                print("Worker shutting down...")
+                print(f"Worker shutting down... (PID: {os.getpid()})")
             asyncio.run_coroutine_threadsafe(self._nc.close(), self.loop).result()
             self.loop.call_soon_threadsafe(self.loop.stop)
+            self.task_executor.shutdown(wait=False)
 
     def _run_loop(self):
-        """
-        Internal method to run the asyncio event loop in a separate thread.
-        """
+        """Run the asyncio event loop in a background thread."""
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     async def _init_nats(self):
         """
-        Initialize the NATS connection, JetStream context, create KV stores for
-        deferred tasks, and set up subscriptions for both immediate and deferred
-        functions.
+        Initialize NATS and Redis connections, and set up subscriptions for tasks.
         """
         self._nc = NATS()
+        servers = self.nats_url if isinstance(self.nats_url, list) else [self.nats_url]
         await self._nc.connect(
-            self.nats_url,
+            servers=servers,
             reconnect_time_wait=2,
             max_reconnect_attempts=-1,
             ping_interval=20,
             max_outstanding_pings=5,
         )
-
-        print("Connected to NATS server")
-
-        # Initialize JetStream context
-        self._js = self._nc.jetstream()
-
-        # Create a KV store for each subject with deferred functions
-        for subject, handlers in self.deferred_functions.items():
-            # Use a default TTL (1 day) or as specified per handler
-            ttl = timedelta(days=1)
-            kv_bucket = f"DEFERRED_TASKS_{subject.replace('.', '_')}"
-            try:
-                kv = await self._js.create_key_value(
-                    config=KeyValueConfig(
-                        bucket=kv_bucket,
-                        ttl=int(ttl.total_seconds()),
-                    )
-                )
-                self._kv_stores[subject] = kv
-                if self.debug:
-                    print(f"[KV] Bucket '{kv_bucket}' created with TTL={ttl}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[KV] Error creating bucket '{kv_bucket}': {e}")
-
-        # Set up subscriptions for immediate execution functions
-        for subject, handlers in self.functions.items():
+        if self.debug:
+            print(f"Connected to NATS server (PID: {os.getpid()})")
+        self._redis = Redis.from_url(self.redis_url, decode_responses=True)
+        if self.debug:
+            print(f"Connected to Redis server at {self.redis_url} (PID: {os.getpid()})")
+        # Set up subscriptions for each registered task
+        for subject, handlers in self.tasks.items():
             for task, queue_group in handlers:
 
                 async def callback(msg: NATSMessage, f=task):
-                    self._handle_message(msg, f)
+                    try:
+                        req = json.loads(msg.data.decode())
+                    except Exception as e:
+                        await msg.respond(f"Error: invalid payload: {e}".encode())
+                        return
+                    mode = req.get("mode", "immediate")
+                    data = req.get("data")
+                    if data is None:
+                        await msg.respond("Error: missing 'data' field".encode())
+                        return
+                    if mode == "immediate":
+                        self._handle_unified_immediate(msg, f, data)
+                    elif mode == "deferred":
+                        task_id = req.get("task_id")
+                        if not task_id:
+                            await msg.respond(
+                                "Error: missing task_id in deferred request".encode()
+                            )
+                            return
+                        self._handle_unified_deferred(msg, f, data, task_id)
+                    else:
+                        await msg.respond(f"Error: unknown mode '{mode}'".encode())
 
                 if queue_group:
                     await self._nc.subscribe(subject, cb=callback, queue=queue_group)
                 else:
                     await self._nc.subscribe(subject, cb=callback)
-
-        # Set up subscriptions for deferred execution functions
-        for subject, handlers in self.deferred_functions.items():
-            for task, queue_group, ttl in handlers:
-
-                async def callback(msg: NATSMessage, f=task, used_ttl=ttl):
-                    self._handle_deferred_message(msg, f, used_ttl)
-
-                if queue_group:
-                    await self._nc.subscribe(subject, cb=callback, queue=queue_group)
-                else:
-                    await self._nc.subscribe(subject, cb=callback)
-
         if self.debug:
             print("Subscriptions set up for subjects:")
-            print("  Immediate:", list(self.functions.keys()))
-            print("  Delayed:", list(self.deferred_functions.keys()))
+            print("  Tasks:", list(self.tasks.keys()))
+            print(f"(PID: {os.getpid()})")
 
-    def _handle_message(self, msg: NATSMessage, task: Callable):
-        """
-        Handle an immediate execution message by starting a new thread to
-        process the message.
+    @staticmethod
+    def _execute_task(task: Callable, data: Any):
+        """Helper method to execute a task."""
+        return task(data)
 
-        Parameters
-        ----------
-        msg : NATSMessage
-            The incoming message.
-        task : Callable
-            The user-defined task to process the message.
-        """
-        threading.Thread(
-            target=self._process_message, args=(msg, task), daemon=True
-        ).start()
-
-    def _process_message(self, msg: NATSMessage, task: Callable):
-        """
-        Process an immediate execution message.
-
-        This method decodes the message data, calls the registered task,
-        and sends the result back as a response.
-
-        Parameters
-        ----------
-        msg : NATSMessage
-            The incoming message.
-        task : Callable
-            The task to be executed.
-        """
+    def _respond_immediate(self, msg: NATSMessage, future: concurrent.futures.Future):
+        """Callback to send the result of an immediate task."""
         try:
-            data = msg.data.decode()
+            result = future.result()
             if self.debug:
-                print(f"[Immediate] Received: {data}")
-            # Execute the user-defined task
-            result = task(data)
-            if self.debug:
-                print(f"[Immediate] Sending response: {result}")
-            # Send the response asynchronously
+                print(f"[Immediate] Sending response: {result} (PID: {os.getpid()})")
             asyncio.run_coroutine_threadsafe(
                 msg.respond(str(result).encode()), self.loop
             )
         except Exception as e:
             if self.debug:
-                print(f"[Immediate] Error: {e}")
+                print(f"[Immediate] Error: {e} (PID: {os.getpid()})")
             asyncio.run_coroutine_threadsafe(
                 msg.respond(f"Error: {str(e)}".encode()), self.loop
             )
 
-    def _handle_deferred_message(
-        self, msg: NATSMessage, task: Callable, ttl: timedelta
-    ):
-        """
-        Handle a delayed execution message by starting a new thread to
-        process the message in the background.
-
-        Parameters
-        ----------
-        msg : NATSMessage
-            The incoming message.
-        task : Callable
-            The task to be executed in a delayed manner.
-        ttl : timedelta
-            The time-to-live for the KV store entry.
-        """
-        threading.Thread(
-            target=self._process_deferred_message, args=(msg, task, ttl), daemon=True
-        ).start()
-
-    def _process_deferred_message(
-        self, msg: NATSMessage, task: Callable, ttl: timedelta
-    ):
-        """
-        Process a delayed execution message.
-
-        This method immediately responds with a generated task_id, then
-        processes the task in the background and updates the task status in
-        the KV store.
-
-        Parameters
-        ----------
-        msg : NATSMessage
-            The incoming message.
-        task : Callable
-            The task to process the delayed message.
-        ttl : timedelta
-            The TTL for the KV store entry.
-        """
-        # Generate a unique task_id and respond immediately
-        task_id = str(uuid.uuid4())
-        asyncio.run_coroutine_threadsafe(msg.respond(task_id.encode()), self.loop)
-
-        # Process the deferred task in a separate thread
-        def process_task():
+    def _handle_unified_immediate(self, msg: NATSMessage, task: Callable, data: Any):
+        """Handle immediate execution requests (mode 'immediate')."""
+        if self.debug:
+            print(f"[Immediate] Received: {data} (PID: {os.getpid()})")
+        if self.max_thread > 1:
+            future = self.task_executor.submit(self._execute_task, task, data)
+            future.add_done_callback(lambda f: self._respond_immediate(msg, f))
+        else:
             try:
-                data = msg.data.decode()
+                result = self._execute_task(task, data)
                 if self.debug:
-                    print(f"[Deferred] Received: {data}, task_id={task_id}")
-                subject = msg.subject
-                self._publish_deferred_status(subject, task_id, "pending", None)
-                result = task(data)
-                self._publish_deferred_status(subject, task_id, "completed", result)
-                if self.debug:
-                    print(f"[Deferred] Task {task_id} completed with result: {result}")
+                    print(
+                        f"[Immediate] Sending response: {result} (PID: {os.getpid()})"
+                    )
+                asyncio.run_coroutine_threadsafe(
+                    msg.respond(str(result).encode()), self.loop
+                )
             except Exception as e:
-                self._publish_deferred_status(msg.subject, task_id, "error", str(e))
                 if self.debug:
-                    print(f"[Deferred] Task {task_id} failed: {e}")
+                    print(f"[Immediate] Error: {e} (PID: {os.getpid()})")
+                asyncio.run_coroutine_threadsafe(
+                    msg.respond(f"Error: {str(e)}".encode()), self.loop
+                )
 
-        threading.Thread(target=process_task, daemon=True).start()
+    def _handle_unified_deferred(
+        self, msg: NATSMessage, task: Callable, data: Any, task_id: str
+    ):
+        """Handle deferred execution requests (mode 'deferred')."""
+        # Respond immediately with ACK (caller already generated task_id and stored QUEUED)
+        # asyncio.run_coroutine_threadsafe(msg.respond("ACK".encode()), self.loop)
+        if self.debug:
+            print(
+                f"[Deferred] Received: {data}, task_id={task_id} (PID: {os.getpid()})"
+            )
+        subject = msg.subject
+        # Update state to PROCESSING
+        self._publish_deferred_status(subject, task_id, "PROCESSING", None)
+        if self.max_thread > 1:
+            future = self.task_executor.submit(self._execute_task, task, data)
+            future.add_done_callback(
+                lambda f: self._handle_deferred_callback(f, subject, task_id)
+            )
+        else:
+            try:
+                result = self._execute_task(task, data)
+                self._publish_deferred_status(subject, task_id, "COMPLETED", result)
+                if self.debug:
+                    print(
+                        f"[Deferred] Task {task_id} completed with result: {result} (PID: {os.getpid()})"
+                    )
+            except Exception as e:
+                self._publish_deferred_status(subject, task_id, "FAILURE", str(e))
+                if self.debug:
+                    print(f"[Deferred] Task {task_id} failed: {e} (PID: {os.getpid()})")
+
+    def _handle_deferred_callback(
+        self,
+        future: concurrent.futures.Future,
+        subject: str,
+        task_id: str,
+    ):
+        """Callback to update deferred task status in Redis after execution."""
+        try:
+            result = future.result()
+            self._publish_deferred_status(subject, task_id, "COMPLETED", result)
+            if self.debug:
+                print(
+                    f"[Deferred] Task {task_id} completed with result: {result} (PID: {os.getpid()})"
+                )
+        except Exception as e:
+            self._publish_deferred_status(subject, task_id, "FAILURE", str(e))
+            if self.debug:
+                print(f"[Deferred] Task {task_id} failed: {e} (PID: {os.getpid()})")
 
     def _publish_deferred_status(
         self, subject: str, task_id: str, status: str, result: Any
     ):
         """
-        Publish the status of a deferred task by storing it in the KV store.
-
-        Parameters
-        ----------
-        subject : str
-            The subject corresponding to the deferred task.
-        task_id : str
-            The unique identifier of the task.
-        status : str
-            The current status of the task ('pending', 'completed', or 'error').
-        result : Any
-            The result of the task execution, or error information.
+        Publish the status and result of a deferred task by storing it in Redis.
+        Redis key format: DEFERRED_TASKS_{subject}:{task_id}
         """
-        kv: KeyValue = self._kv_stores.get(subject)
-        if not kv:
-            return
+        redis_key = f"DEFERRED_TASKS_{subject.replace('.', '_')}:{task_id}"
         doc = {
             "task_id": task_id,
             "status": status,
             "result": result,
         }
-        asyncio.run_coroutine_threadsafe(
-            kv.put(task_id, json.dumps(doc).encode()), self.loop
-        )
+        try:
+            self._redis.set(redis_key, json.dumps(doc))
+        except Exception as e:
+            if self.debug:
+                print(f"[Redis] Error storing deferred status for {redis_key}: {e}")
 
 
 ##############################################################################
-# Synchronous Client (Caller) Implementation
+# Synchronous Client (Caller) Implementation using Redis for KV Storage
 ##############################################################################
 class EdaliteCaller:
     """
-    A synchronous client to call immediate or deferred functions registered on
-    an EdaliteWorker via NATS.
-
-    This client manages its own background asyncio event loop to interact with
-    the asynchronous NATS client.
-
-    Parameters
-    ----------
-    nats_url : str, optional
-        The URL of the NATS server (default is "nats://localhost:4222").
-    debug : bool, optional
-        If True, prints debug information (default is False).
+    Synchronous client to call immediate or deferred functions registered on an
+    EdaliteWorker via NATS messaging. The client sends a JSON payload with a "mode"
+    field ("immediate" or "deferred") and "data", and deferred task results are
+    retrieved from Redis. Deferred task states progress as:
+        QUEUED -> PROCESSING -> COMPLETED (or FAILURE)
     """
 
-    def __init__(self, nats_url: str = "nats://localhost:4222", debug: bool = False):
+    def __init__(
+        self,
+        nats_url: Union[str, List[str]] = "nats://localhost:4222",
+        redis_url: str = "redis://localhost:6379/0",
+        debug: bool = False,
+    ):
         self.nats_url = nats_url
+        self.redis_url = redis_url
         self.debug = debug
+
         self._nc = None  # NATS client (asynchronous)
-        self._js = None  # JetStream context
+        self._redis = None  # Redis synchronous client
         self.loop = None  # Background asyncio event loop
 
     def connect(self) -> "EdaliteCaller":
         """
-        Connect to the NATS server and initialize the JetStream context.
-
-        This method starts a background asyncio event loop in a separate thread
-        and initializes the asynchronous NATS client.
-
-        Returns
-        -------
-        EdaliteCaller
-            The instance itself after successful connection.
-
-        Examples
-        --------
-        >>> caller = EdaliteCaller(nats_url="nats://localhost:4222", debug=True).connect()
-        >>> result = caller.request("service.immediate", "Hello!")
+        Connect to the NATS server and initialize the Redis client.
         """
         self.loop = asyncio.new_event_loop()
         loop_thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -554,57 +422,34 @@ class EdaliteCaller:
         return self
 
     def _run_loop(self):
-        """
-        Internal method to run the asyncio event loop in a background thread.
-        """
+        """Run the asyncio event loop in a background thread."""
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     async def _init_nats(self):
         """
-        Asynchronously initialize the NATS client and JetStream context.
+        Initialize the NATS and Redis clients.
         """
         self._nc = NATS()
+        servers = self.nats_url if isinstance(self.nats_url, list) else [self.nats_url]
         await self._nc.connect(
-            self.nats_url,
+            servers=servers,
             reconnect_time_wait=2,
             max_reconnect_attempts=-1,
             ping_interval=20,
             max_outstanding_pings=5,
         )
-        self._js = self._nc.jetstream()
+        self._redis = Redis.from_url(self.redis_url, decode_responses=True)
 
     def request(self, subject: str, data: Any, timeout: float = 30.0) -> str:
         """
-        Call an immediate execution function and wait synchronously for a response.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to which the request is sent.
-        data : Any
-            The data to be sent (will be converted to string).
-        timeout : float, optional
-            The request timeout in seconds (default is 30.0).
-
-        Returns
-        -------
-        str
-            The response returned by the worker.
-
-        Raises
-        ------
-        RuntimeError
-            If the function call fails or returns an error.
-
-        Examples
-        --------
-        >>> result = caller.request("service.immediate", "Hello!")
-        >>> print("Response:", result)
+        Call an immediate execution function and return the result synchronously.
+        Payload: {"mode": "immediate", "data": <data>}
         """
         try:
+            payload = json.dumps({"mode": "immediate", "data": str(data)})
             future = asyncio.run_coroutine_threadsafe(
-                self._nc.request(subject, str(data).encode(), timeout=timeout),
+                self._nc.request(subject, payload.encode(), timeout=timeout),
                 self.loop,
             )
             response = future.result(timeout)
@@ -613,90 +458,50 @@ class EdaliteCaller:
                 raise RuntimeError(result[6:].strip())
             return result
         except Exception as e:
-            raise RuntimeError(f"함수 호출 실패 ({subject}): {e}")
+            raise RuntimeError(f"Function call failed ({subject}): {e}")
 
     def delay(self, subject: str, data: Any, timeout: float = 30.0) -> str:
         """
         Call a deferred execution function.
+        Payload: {"mode": "deferred", "data": <data>, "task_id": <generated_id>}
 
-        This method returns immediately with a task_id. The actual processing
-        is done in the background by the worker.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to which the request is sent.
-        data : Any
-            The data to be sent (will be converted to string).
-        timeout : float, optional
-            The request timeout in seconds (default is 30.0).
-
-        Returns
-        -------
-        str
-            The task_id assigned by the worker.
-
-        Raises
-        ------
-        RuntimeError
-            If the deferred function call fails or returns an error.
-
-        Examples
-        --------
-        >>> task_id = caller.delay("service.deferred", "Hello Deferred!")
-        >>> print("Task ID:", task_id)
+        The caller generates a task_id and stores the initial state (QUEUED) in Redis.
+        Then it publishes the payload via NATS without waiting for an ACK.
+        The worker will update the state to PROCESSING and eventually to COMPLETED (or FAILURE).
         """
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._nc.request(subject, str(data).encode(), timeout=timeout),
-                self.loop,
+            # Generate task_id and store initial state QUEUED in Redis
+            task_id = str(uuid.uuid4())
+            redis_key = f"DEFERRED_TASKS_{subject.replace('.', '_')}:{task_id}"
+            doc = {"task_id": task_id, "status": "QUEUED", "result": None}
+            try:
+                self._redis.set(redis_key, json.dumps(doc))
+            except Exception as e:
+                if self.debug:
+                    print(f"Error storing initial deferred status: {e}")
+            payload = json.dumps(
+                {"mode": "deferred", "data": str(data), "task_id": task_id}
             )
-            response = future.result(timeout)
-            task_id = response.data.decode()
-            if task_id.startswith("Error:"):
-                raise RuntimeError(task_id[6:].strip())
+            # Use publish instead of request so as to return task_id immediately
+            asyncio.run_coroutine_threadsafe(
+                self._nc.publish(subject, payload.encode()), self.loop
+            ).result()
             return task_id
         except Exception as e:
-            raise RuntimeError(f"지연 함수 호출 실패({subject}): {e}")
+            raise RuntimeError(f"Deferred function call failed ({subject}): {e}")
 
     def get_deferred_result(self, subject: str, task_id: str) -> dict:
         """
-        Retrieve the result of a deferred function from the KV store.
-
-        Parameters
-        ----------
-        subject : str
-            The subject corresponding to the deferred function.
-        task_id : str
-            The task identifier returned when the deferred function was called.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the task_id, status, and result.
-            If the task is not found or an error occurs, an error message is returned.
-
-        Examples
-        --------
-        >>> result = caller.get_deferred_result("service.deferred", task_id)
-        >>> print("Deferred Result:", result)
+        Retrieve the result of a deferred task from Redis.
+        Redis key format: DEFERRED_TASKS_{subject}:{task_id}
+        The returned dict contains 'task_id', 'status', and 'result'.
         """
-        kv_bucket = f"DEFERRED_TASKS_{subject.replace('.', '_')}"
+        redis_key = f"DEFERRED_TASKS_{subject.replace('.', '_')}:{task_id}"
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._js.key_value(kv_bucket), self.loop
-            )
-            kv = future.result()
-        except Exception as e:
-            return {"error": f"KV 버킷 조회 실패: {e}"}
-        try:
-            future = asyncio.run_coroutine_threadsafe(kv.get(task_id), self.loop)
-            entry = future.result()
-            if not entry:
-                return {
-                    "error": f"task_id={task_id}에 대한 KV 데이터를 찾을 수 없습니다."
-                }
-            data = json.loads(entry.value)
+            value = self._redis.get(redis_key)
+            if value is None:
+                return {"error": f"No KV data found for task_id={task_id}"}
+            data = json.loads(value)
             return data
         except Exception as e:
             return {"error": str(e)}
@@ -704,143 +509,72 @@ class EdaliteCaller:
     def close(self):
         """
         Close the NATS connection and stop the background asyncio event loop.
-
-        Examples
-        --------
-        >>> caller.close()
         """
         asyncio.run_coroutine_threadsafe(self._nc.close(), self.loop).result()
         self.loop.call_soon_threadsafe(self.loop.stop)
 
-    def subscribe(self, subject: str, callback: Callable):
-        """
-        Subscribe to a broadcast message subject.
-
-        The provided callback is a synchronous function which will be executed
-        in a separate thread upon message receipt.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to subscribe to.
-        callback : Callable
-            The function to call when a message is received. The function should
-            accept a single parameter (the NATSMessage).
-
-        Examples
-        --------
-        >>> def handle_broadcast(msg):
-        ...     print("Broadcast received:", msg.data.decode())
-        >>>
-        >>> caller.subscribe("broadcast.subject", handle_broadcast)
-        """
-
-        async def async_callback(msg: NATSMessage):
-            threading.Thread(target=callback, args=(msg,), daemon=True).start()
-
-        asyncio.run_coroutine_threadsafe(
-            self._nc.subscribe(subject, cb=async_callback), self.loop
-        )
-
 
 ##############################################################################
-# Asynchronous Client (Caller) Implementation
+# Asynchronous Client (Caller) Implementation using Redis for KV Storage
 ##############################################################################
 class AsyncEdaliteCaller:
     """
-    An asynchronous client to call immediate or deferred functions registered on
-    an EdaliteWorker via NATS.
-
-    This client uses the currently running asyncio event loop.
-
-    Parameters
-    ----------
-    nats_url : str, optional
-        The URL of the NATS server (default is "nats://localhost:4222").
-    debug : bool, optional
-        If True, prints debug information (default is False).
-
-    Class Methods
-    -------------
-    connect(nats_url: str, debug: bool) -> AsyncEdaliteCaller
-        Asynchronously create an instance and connect to NATS.
+    Asynchronous client to call immediate or deferred functions registered on an
+    EdaliteWorker via NATS messaging. The client sends a JSON payload with "mode"
+    ("immediate" or "deferred") and "data" (and "task_id" for deferred mode),
+    and deferred task results are retrieved from Redis asynchronously.
     """
 
-    def __init__(self, nats_url: str = "nats://localhost:4222", debug: bool = False):
+    def __init__(
+        self,
+        nats_url: Union[str, List[str]] = "nats://localhost:4222",
+        redis_url: str = "redis://localhost:6379/0",
+        debug: bool = False,
+    ):
         self.nats_url = nats_url
+        self.redis_url = redis_url
         self.debug = debug
+
         self._nc = None  # NATS client (asynchronous)
-        self._js = None  # JetStream context
-        # Use the currently running event loop or manage separately
+        self._redis = None  # Redis asynchronous client
         self.loop = asyncio.get_event_loop()
 
     @classmethod
     async def connect(
-        cls, nats_url: str = "nats://localhost:4222", debug: bool = False
+        cls,
+        nats_url: Union[str, List[str]] = "nats://localhost:4222",
+        redis_url: str = "redis://localhost:6379/0",
+        debug: bool = False,
     ) -> "AsyncEdaliteCaller":
         """
-        Asynchronously create an instance of AsyncEdaliteCaller and connect to the NATS server.
-
-        Parameters
-        ----------
-        nats_url : str, optional
-            The URL of the NATS server (default is "nats://localhost:4222").
-        debug : bool, optional
-            If True, prints debug information (default is False).
-
-        Returns
-        -------
-        AsyncEdaliteCaller
-            An instance of AsyncEdaliteCaller with an established connection.
-
-        Examples
-        --------
-        >>> caller = await AsyncEdaliteCaller.connect(nats_url="nats://localhost:4222", debug=True)
-        >>> result = await caller.request("service.immediate", "Hello!")
+        Create an instance of AsyncEdaliteCaller and connect to NATS and Redis.
         """
-        instance = cls(nats_url, debug)
+        instance = cls(nats_url, redis_url, debug)
         instance._nc = NATS()
+        servers = (
+            instance.nats_url
+            if isinstance(instance.nats_url, list)
+            else [instance.nats_url]
+        )
         await instance._nc.connect(
-            nats_url,
+            servers=servers,
             reconnect_time_wait=2,
             max_reconnect_attempts=-1,
             ping_interval=20,
             max_outstanding_pings=5,
         )
-        instance._js = instance._nc.jetstream()
+        instance._redis = RedisAsync.from_url(instance.redis_url, decode_responses=True)
         if debug:
             print("AsyncEdaliteCaller connected.")
         return instance
 
     async def request(self, subject: str, data: Any, timeout: float = 30.0) -> str:
         """
-        Asynchronously call an immediate execution function.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to which the request is sent.
-        data : Any
-            The data to be sent (will be converted to string).
-        timeout : float, optional
-            The request timeout in seconds (default is 30.0).
-
-        Returns
-        -------
-        str
-            The response returned by the worker.
-
-        Raises
-        ------
-        RuntimeError
-            If the function returns an error response.
-
-        Examples
-        --------
-        >>> result = await caller.request("service.immediate", "Async Hello!")
-        >>> print("Response:", result)
+        Call an immediate execution function asynchronously.
+        Payload: {"mode": "immediate", "data": <data>}
         """
-        response = await self._nc.request(subject, str(data).encode(), timeout=timeout)
+        payload = json.dumps({"mode": "immediate", "data": str(data)})
+        response = await self._nc.request(subject, payload.encode(), timeout=timeout)
         result = response.data.decode()
         if result.startswith("Error:"):
             raise RuntimeError(result[6:].strip())
@@ -848,109 +582,50 @@ class AsyncEdaliteCaller:
 
     async def delay(self, subject: str, data: Any, timeout: float = 30.0) -> str:
         """
-        Asynchronously call a deferred execution function.
+        Call a deferred execution function asynchronously.
+        Payload: {"mode": "deferred", "data": <data>, "task_id": <generated_id>}
 
-        This method returns immediately with a task_id. The actual processing
-        is done in the background by the worker.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to which the request is sent.
-        data : Any
-            The data to be sent (will be converted to string).
-        timeout : float, optional
-            The request timeout in seconds (default is 30.0).
-
-        Returns
-        -------
-        str
-            The task_id assigned by the worker.
-
-        Raises
-        ------
-        RuntimeError
-            If the function returns an error response.
-
-        Examples
-        --------
-        >>> task_id = await caller.delay("service.deferred", "Async Deferred Hello!")
-        >>> print("Task ID:", task_id)
+        The caller generates a task_id and stores the initial state (QUEUED) in Redis.
+        Then it publishes the payload via NATS without waiting for an ACK.
+        The worker will update the state to PROCESSING and eventually to COMPLETED (or FAILURE).
         """
-        response = await self._nc.request(subject, str(data).encode(), timeout=timeout)
-        task_id = response.data.decode()
-        if task_id.startswith("Error:"):
-            raise RuntimeError(task_id[6:].strip())
+        task_id = str(uuid.uuid4())
+        redis_key = f"DEFERRED_TASKS_{subject.replace('.', '_')}:{task_id}"
+        doc = {"task_id": task_id, "status": "QUEUED", "result": None}
+        try:
+            await self._redis.set(redis_key, json.dumps(doc))
+        except Exception as e:
+            if self.debug:
+                print(f"Error storing initial deferred status: {e}")
+        payload = json.dumps(
+            {"mode": "deferred", "data": str(data), "task_id": task_id}
+        )
+        await self._nc.publish(subject, payload.encode())
         return task_id
 
     async def get_deferred_result(self, subject: str, task_id: str) -> dict:
         """
-        Asynchronously retrieve the result of a deferred function from the KV store.
-
-        Parameters
-        ----------
-        subject : str
-            The subject corresponding to the deferred function.
-        task_id : str
-            The task identifier returned when the deferred function was called.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the task_id, status, and result, or an error message.
-
-        Examples
-        --------
-        >>> result = await caller.get_deferred_result("service.deferred", task_id)
-        >>> print("Deferred Result:", result)
+        Retrieve the result of a deferred task from Redis asynchronously.
         """
-        kv_bucket = f"DEFERRED_TASKS_{subject.replace('.', '_')}"
+        redis_key = f"DEFERRED_TASKS_{subject.replace('.', '_')}:{task_id}"
         try:
-            kv = await self._js.key_value(kv_bucket)
-        except Exception as e:
-            return {"error": f"KV 버킷 조회 실패: {e}"}
-        try:
-            entry = await kv.get(task_id)
-            if not entry:
-                return {
-                    "error": f"task_id={task_id}에 대한 KV 데이터를 찾을 수 없습니다."
-                }
-            data = json.loads(entry.value)
+            value = await self._redis.get(redis_key)
+            if value is None:
+                return {"error": f"No KV data found for task_id={task_id}"}
+            data = json.loads(value)
             return data
         except Exception as e:
             return {"error": str(e)}
 
     async def close(self):
         """
-        Asynchronously close the NATS connection.
-
-        Examples
-        --------
-        >>> await caller.close()
+        Close the NATS and Redis connections asynchronously.
         """
         await self._nc.close()
+        await self._redis.close()
 
     async def subscribe(self, subject: str, callback: Callable):
         """
-        Subscribe to a broadcast message subject asynchronously.
-
-        The callback can be either an asynchronous function or a synchronous
-        function. In case of a synchronous callback, it will be executed in a
-        separate thread.
-
-        Parameters
-        ----------
-        subject : str
-            The subject to subscribe to.
-        callback : Callable
-            The function to call when a message is received. It should accept a
-            single parameter (the NATSMessage).
-
-        Examples
-        --------
-        >>> async def handle_msg(msg):
-        ...     print("Broadcast received:", msg.data.decode())
-        >>>
-        >>> await caller.subscribe("broadcast.subject", handle_msg)
+        Subscribe to a subject for broadcast messages.
         """
         await self._nc.subscribe(subject, cb=callback)

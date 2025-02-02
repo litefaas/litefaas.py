@@ -9,8 +9,7 @@ async def main():
 
     # 병렬로 5번 delay 실행
     tasks = [
-        caller.delay("example.deferred", f"Async deferred hello {i}!")
-        for i in range(15)
+        caller.delay("example.deferred", f"Async deferred hello {i}!") for i in range(5)
     ]
     task_ids = await asyncio.gather(*tasks)
 

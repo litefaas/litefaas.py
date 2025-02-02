@@ -1,5 +1,5 @@
 import asyncio
-from edalite.core import LitefaasClient
+from edalite.worker import LitefaasClient
 
 async def main():
     # 클라이언트 연결

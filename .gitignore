@@ -1,3 +1,5 @@
 poetry.lock
 __pycache__
 dist
+nats-data
+redis-data
