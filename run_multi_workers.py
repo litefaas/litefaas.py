@@ -1,6 +1,6 @@
 import multiprocessing
 import os
-from litefaas_py.core import LitefaasServer, run_server
+from edalite.core import LitefaasServer, run_server
 import asyncio
 
 # 서버 인스턴스

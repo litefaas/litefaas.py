@@ -1,28 +1,21 @@
-from litefaas_py.core import LitefaasWorker, run_worker
-import asyncio
+from edalite.core import EdaliteWorker
+import random
 
-# FaaS 인스턴스 생성
-faas = LitefaasWorker(debug=True)
-
-
-@faas.func("async.task", queue_group="workers")
-async def async_task(data: str):
-    await asyncio.sleep(1)  # I/O 작업 시뮬레이션
-    print(f"async_task 처리 완료: {data}")
-    return f"async_task 처리 완료: {data}"
+worker = EdaliteWorker(debug=False)
 
 
-@faas.deferred("deferred.task", queue_group="deferred_workers")
-async def deferred_task(data: str):
-
-    await asyncio.sleep(0.1)
-
-    for i in range(2000):
-        print(f"deferred_task 처리 중: {i}")
-    print(f"deferred_task 처리 완료: {data}")
-    return f"deferred_task 처리 완료: {data}"
+@worker.task("example.immediate", queue_group="immediate_workers")
+def echo(data):
+    return f"Echo: {data}"
 
 
-if __name__ == "__main__":
-    # 서버 시작
-    run_worker(faas)
+@worker.delayed_task("example.deferred", queue_group="deferred_workers")
+def deferred_echo(data):
+    # 시간이 오래 걸리는 작업이라 가정
+    import time
+
+    time.sleep(random.randint(1, 5))
+    return f"Deferred Echo: {data}"
+
+
+worker.start()

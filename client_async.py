@@ -1,54 +1,30 @@
 import asyncio
-from litefaas_py.core import LitefaasCaller
-import time
+from edalite.core import AsyncEdaliteCaller
 
 
 async def main():
-    # 클라이언트 연결
-    client = await LitefaasCaller.connect()
+    caller = await AsyncEdaliteCaller.connect(debug=True)
+    # result = await caller.request("example.immediate", "Hello from async!")
+    # print("Async immediate result:", result)
 
-    try:
-        print("서버에 연결됨")
+    # 병렬로 5번 delay 실행
+    tasks = [
+        caller.delay("example.deferred", f"Async deferred hello {i}!")
+        for i in range(15)
+    ]
+    task_ids = await asyncio.gather(*tasks)
 
-        # 비동기 작업 10회 병렬 실행
-        print("\n비동기 작업 10회 시작...")
-        start_time = time.time()
-        tasks = [
-            client.request("async.task", f"테스트 메시지 {i}", timeout=30.0)
-            for i in range(10)
-        ]
-        results = await asyncio.gather(*tasks)
+    # task_id 출력
+    for i, task_id in enumerate(task_ids):
+        print(f"Task {i} ID:", task_id)
 
-        for i, result in enumerate(results):
-            print(f"비동기 작업 {i+1}/10 완료: {result}")
+    await asyncio.sleep(2)
 
-        task_ids = []
+    for i, task_id in enumerate(task_ids):
+        result = await caller.get_deferred_result("example.deferred", task_id)
+        print(f"Task {i} Result:", result)
 
-        # 지연 작업 10회 실행
-        print("\n지연 작업 10회 시작...")
-        for i in range(10):
-            task_id = await client.delay(
-                "deferred.task", f"지연 메시지 {i}", timeout=30.0
-            )
-            print(f"지연 작업 {i+1}/10 완료: {task_id}")
-            task_ids.append(task_id)
-
-        time.sleep(1)
-
-        # 지연 작업 결과 조회
-        for task_id in task_ids:
-            result = await client.get_deferred_result("deferred.task", task_id)
-            print(f"지연 작업 결과: {result}")
-
-        end_time = time.time()
-        print(f"작업 총 소요시간: {end_time - start_time:.2f}초")
-
-    except Exception as e:
-        print(f"에러 발생: {e}")
-        print("서버가 실행 중인지 확인하세요.")
-    finally:
-        await client.close()
+    await caller.close()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

@@ -1,5 +1,5 @@
 [project]
-name = "litefaas_py"
+name = "edalite"
 version = "0.3.0"
 description = ""
 authors = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{include = "litefaas_py"}]
+packages = [{include = "edalite"}]
 
 
 [build-system]
